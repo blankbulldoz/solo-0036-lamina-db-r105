@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bounded production walkthroughs using only the public HTTP service."""
 import argparse, concurrent.futures, json, os, pathlib, shutil, socket, subprocess, tempfile, time, urllib.request, urllib.error
-WORKFLOWS=['catalog-create','txn-write','snapshot-read','index-build','query-plan','sql-execute','txn-conflict','restart','checkpoint','backup-restore','changes','vacuum','transaction-close','statistics']
+WORKFLOWS=['catalog-create','txn-write','snapshot-read','index-build','query-plan','sql-execute','txn-conflict','restart','checkpoint','backup-restore','changes','vacuum','transaction-close','statistics','partial-publish','partial-recovery']
 class Session:
  def __init__(self,binary,root,restore=None):
   self.binary=str(binary);self.root=pathlib.Path(root);self.restore=restore;self.process=None;self.log=None
@@ -36,6 +36,9 @@ class Session:
  def begin(self,readonly=False):return self.call('POST','/transactions',{'read_only':readonly},201)['id']
  def put(self,tx,row,status=200,insert=False):return self.call('POST',f'/transactions/{tx}/put',{'relation':'spectra','row':row,'insert_only':insert},status)
  def commit(self,tx,status=200):return self.call('POST',f'/transactions/{tx}/commit',status=status)
+ def publish(self,tx,keys,dry=False,status=200):return self.call('POST',f'/transactions/{tx}/publish',{'selection':[{'relation':'spectra','key':k} for k in keys],'dry_run':dry},status)
+ def refresh(self,tx,dry=False,status=200):return self.call('POST',f'/transactions/{tx}/refresh',{'dry_run':dry},status)
+ def txstatus(self,tx):return self.call('GET',f'/transactions/{tx}')
  def query(self,**kwargs):return self.call('POST','/query',{'relation':'spectra',**kwargs})
  def stats(self):return self.call('GET','/stats')
 def require(condition,message):
@@ -152,6 +155,105 @@ def walkthrough(name,binary):
     q=s.query(where=[{'column':'amplitude','op':'>=','value':40}],limit=2)
     require(q['matched']==3 and q['scanned']==3 and len(q['rows'])==2 and q['truncated'],'query fact meanings conflated')
     observations={'query':q,'stats':s.stats()}
+   elif name=='partial-publish':
+    s.call('POST','/indexes',{'name':'by_band','relation':'spectra','column':'band','unique':True},201)
+    edit=s.begin()
+    s.put(edit,tuple_(10,band='approved'));s.put(edit,tuple_(11,band='pending'))
+    # an unapproved unique-value swap: two staged rows exchange band values
+    s.put(edit,tuple_(1,band='b2'),insert=False);s.put(edit,tuple_(2,band='b1'),insert=False)
+    before=s.stats()['sequence']
+    rejected=s.publish(edit,[1],status=409)
+    require(rejected['report']['selected'][0]['key']=='int:1' and rejected['report']['unique_violations'],
+            'dependent swap half was not rejected with its violation report')
+    require(s.stats()['sequence']==before and s.txstatus(edit)['remaining_writes']==4,
+            'rejected partial publish consumed a sequence or mutated the edit')
+    s.publish(edit,[],status=400);s.publish(edit,[99],status=400)
+    published=s.publish(edit,[10]);require(published['sequence']==before+1 and published['writes']==1,
+            'independent selection did not publish as one complete commit')
+    require(s.txstatus(edit)['remaining_writes']==3 and s.txstatus(edit)['partial_publishes']==1,
+            'edit context did not survive its partial publish')
+    # pinned view keeps the old read basis and own remaining writes only
+    pinned=s.query(transaction=edit);require(all(r['sample']!=10 for r in pinned['rows']),
+            'pinned view leaked the already-published row through committed state')
+    require(next(r for r in pinned['rows'] if r['sample']==1)['band']=='b2','pinned view lost own write')
+    # head view shows the own publication plus other callers' commits, never conflated
+    head=s.query(transaction=edit,view='head');require(any(r['sample']==10 for r in head['rows']),
+            'head view hid the edit own publication')
+    require(next(r for r in head['rows'] if r['sample']==1)['band']=='b1',
+            'head view must show committed values, not the private overlay')
+    external=s.begin();s.put(external,tuple_(20,band='external'));s.commit(external)
+    require(all(r['sample']!=20 for r in s.query(transaction=edit)['rows']),
+            'pinned view adopted another caller value as the edit basis')
+    require(any(r['sample']==20 for r in s.query(transaction=edit,view='head')['rows']),
+            'head view did not expose the intervening external commit')
+    # interleaving conflict before any view conversion: both edits start from
+    # the same snapshot, so the second first-committer-wins loser must be rejected
+    rival=s.begin();clash=s.begin()
+    s.put(rival,tuple_(3,band='rival'),insert=False);s.put(clash,tuple_(3,band='clash'),insert=False)
+    s.commit(rival)
+    fail=s.publish(clash,[3],status=409);require(fail['report']['conflicts'][0]['key']=='int:3',
+            'interleaved commit did not produce a first-committer-wins conflict')
+    require(s.txstatus(clash)['remaining_writes']==1,'failed publish discarded the retained edit')
+    cost=s.refresh(clash,dry=True);require(cost['conflicts'][0]['key']=='int:3',
+            'refresh cost did not disclose the conflict being accepted')
+    s.refresh(clash);s.publish(clash,[3]);s.call('POST',f'/transactions/{clash}/rollback')
+    # a commit landing after refresh is still a brand-new first-committer-wins
+    late=s.begin();winner=s.begin()
+    s.put(late,tuple_(4,band='late'),insert=False);s.put(winner,tuple_(4,band='winner'),insert=False)
+    s.commit(winner)
+    late_fail=s.publish(late,[4],status=409)
+    require(late_fail['report']['conflicts'][0]['key']=='int:4','post-refresh conflict not enforced')
+    s.call('POST',f'/transactions/{late}/rollback')
+    # refresh cost is checkable before the conversion; vacuum stays pinned meanwhile
+    dry=s.refresh(edit,dry=True);require(dry['advanced'] and s.txstatus(edit)['snapshot']==before,
+            'refresh dry-run moved the snapshot')
+    requested=s.stats()['sequence'];pinned_vac=s.call('POST','/vacuum',{'horizon':requested})
+    require(pinned_vac['pinned'],'long edit stopped pinning retention before refresh')
+    # the vacuum attempt is itself a durable record; refresh still lands on current head
+    head=s.stats()['sequence']
+    s.refresh(edit);require(s.txstatus(edit)['snapshot']==head,'refresh did not advance the view')
+    reclaimed=s.call('POST','/vacuum',{'horizon':head});require(not reclaimed['pinned'],
+            'refreshed edit still blocked version reclamation')
+    s.call('POST','/query',{'relation':'spectra','at':before},410)
+    # legacy one-shot commit still publishes the remaining staged rows atomically
+    final=s.commit(edit);require(final['writes']==3,'one-shot commit no longer handles the remainder')
+    s.commit(edit,404)
+    observations={'rejected':rejected['report'],'published':published,'refresh':dry,'final':final,
+                  'stats':s.stats()}
+   elif name=='partial-recovery':
+    s.call('POST','/indexes',{'name':'by_band','relation':'spectra','column':'band','unique':True},201)
+    edit=s.begin()
+    s.put(edit,tuple_(10,band='approved'));s.put(edit,tuple_(11,band='pending'))
+    s.put(edit,tuple_(12,band='held'))
+    first=s.publish(edit,[10]);second=s.publish(edit,[12])
+    require(first['sequence']+1==second['sequence'],'partial publishes lost commit ordering')
+    require(s.txstatus(edit)['published_sequences']==[first['sequence'],second['sequence']],
+            'edit lineage did not record its durable publications')
+    durable=s.query()['rows'];require(any(r['sample']==11 for r in s.query(transaction=edit)['rows']),
+            'pinned view lost the still-private remainder')
+    require(all(r['sample']!=11 for r in durable),'unpublished row became externally visible')
+    # rejection keeps everything needed to retry, and writes nothing durable
+    s.put(edit,tuple_(2,band='b1'),insert=False)  # duplicates committed key1 band b1
+    seq_before=s.stats()['sequence']
+    bad=s.publish(edit,[2],status=409);require(s.stats()['sequence']==seq_before,
+            'rejected publish advanced the journal')
+    require(s.txstatus(edit)['remaining_writes']==2,'rejected publish did not preserve the edit')
+    s.call('POST',f'/transactions/{edit}/rollback')
+    page=s.call('GET',f'/changes?after={seed_seq}&limit=100')
+    partials=[r for r in page['records'] if r.get('edit')=='partial']
+    require(len(partials)==2 and all(len(r['writes'])==1 for r in partials),
+            'change feed did not preserve complete partial-commit boundaries')
+    s.call('POST','/checkpoint')
+    s.stop();s.start()
+    rows=s.query()['rows']
+    require(any(r['sample']==10 for r in rows) and any(r['sample']==12 for r in rows),
+            'restart lost a truly published row')
+    require(all(r['sample']!=11 for r in rows),'restart resurrected a never-published private row')
+    again=s.call('GET',f'/changes?after={seed_seq}&limit=100')
+    require([r['sequence'] for r in again['records'] if r.get('edit')=='partial']==
+            [first['sequence'],second['sequence']],'restart changed the durable publish lineage')
+    observations={'published_sequences':[first['sequence'],second['sequence']],
+                  'rejected':bad['report'],'after_restart':rows,'changes':again}
    else:raise ValueError(name)
    return {'workflow':name,'status':'observed','observations':observations}
   finally:

@@ -77,7 +77,12 @@ func respondError(w http.ResponseWriter, err error) {
 		slog.Error("request failed", "error", err)
 		message = "internal database error"
 	}
-	write(w, status, map[string]any{"error": map[string]string{"code": code, "message": message}})
+	payload := map[string]any{"error": map[string]string{"code": code, "message": message}}
+	var reported *engine.ReportError
+	if errors.As(err, &reported) {
+		payload["report"] = reported.Report
+	}
+	write(w, status, payload)
 }
 func (s *Server) routes() {
 	const p = "/v1/lamina"
@@ -89,6 +94,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST "+p+"/transactions/{tx}/put", s.put)
 	s.mux.HandleFunc("POST "+p+"/transactions/{tx}/delete", s.deleteRow)
 	s.mux.HandleFunc("POST "+p+"/transactions/{tx}/commit", s.commit)
+	s.mux.HandleFunc("POST "+p+"/transactions/{tx}/publish", s.publish)
+	s.mux.HandleFunc("POST "+p+"/transactions/{tx}/refresh", s.refresh)
+	s.mux.HandleFunc("GET "+p+"/transactions/{tx}", s.txnStatus)
 	s.mux.HandleFunc("POST "+p+"/transactions/{tx}/rollback", s.rollback)
 	s.mux.HandleFunc("POST "+p+"/get", s.get)
 	s.mux.HandleFunc("POST "+p+"/query", s.query)

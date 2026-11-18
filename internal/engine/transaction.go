@@ -15,11 +15,23 @@ type staged struct {
 	InsertOnly bool
 }
 type Transaction struct {
-	ID       string `json:"id"`
-	Snapshot uint64 `json:"snapshot"`
-	ReadOnly bool   `json:"read_only"`
-	Started  string `json:"started"`
-	writes   map[string]map[string]staged
+	ID               string   `json:"id"`
+	Snapshot         uint64   `json:"snapshot"`
+	ReadOnly         bool     `json:"read_only"`
+	Started          string   `json:"started"`
+	Remaining        int      `json:"remaining_writes"`
+	PartialPublishes uint64   `json:"partial_publishes"`
+	PublishedAt      []uint64 `json:"published_sequences,omitempty"`
+	// OriginalSnapshot is the read basis the edit started with. It never
+	// advances, so refresh cost reports can keep describing the view the
+	// edit is giving up even after several conversions.
+	OriginalSnapshot uint64 `json:"original_snapshot"`
+	// conflictBase is the sequence against which first-committer-wins is
+	// evaluated. It tracks the last refresh: once a user accepts a view
+	// conversion, intervening commits listed in the refresh report are no
+	// longer re-reported as conflicts at publish.
+	conflictBase uint64
+	writes       map[string]map[string]staged
 }
 type Commit struct {
 	Sequence uint64 `json:"sequence"`
@@ -40,6 +52,8 @@ func (d *DB) Begin(readOnly bool) (Transaction, error) {
 		return Transaction{}, err
 	}
 	tx := &Transaction{ID: hex.EncodeToString(id[:]), Snapshot: d.sequence, ReadOnly: readOnly, Started: time.Now().UTC().Format(time.RFC3339Nano), writes: map[string]map[string]staged{}}
+	tx.conflictBase = d.sequence
+	tx.OriginalSnapshot = d.sequence
 	d.transactions[tx.ID] = tx
 	out := *tx
 	out.writes = nil
@@ -166,7 +180,7 @@ func (d *DB) Commit(id string) (Commit, error) {
 	writes := make([]versions.Mutation, 0)
 	for table, mutations := range tx.writes {
 		for key, m := range mutations {
-			if d.store.Latest(table, key) > tx.Snapshot {
+			if d.store.Latest(table, key) > tx.conflictBase {
 				d.conflicts++
 				return Commit{}, fault("conflict", "write conflict on %s", table)
 			}
@@ -178,6 +192,9 @@ func (d *DB) Commit(id string) (Commit, error) {
 		}
 	}
 	if len(writes) == 0 {
+		// An edit context whose rows were all partially published closes
+		// without consuming another sequence; its published lineage remains
+		// durable in the journal.
 		return Commit{Sequence: tx.Snapshot}, nil
 	}
 	sort.Slice(writes, func(i, j int) bool {

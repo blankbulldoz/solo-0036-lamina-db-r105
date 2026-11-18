@@ -10,6 +10,7 @@ type Record struct {
 	Sequence    uint64              `json:"sequence"`
 	Kind        string              `json:"kind"`
 	Transaction string              `json:"transaction,omitempty"`
+	Edit        string              `json:"edit,omitempty"`
 	Relation    *catalog.Relation   `json:"relation,omitempty"`
 	Index       *catalog.Index      `json:"index,omitempty"`
 	Writes      []versions.Mutation `json:"writes,omitempty"`

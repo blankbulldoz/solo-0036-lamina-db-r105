@@ -368,6 +368,50 @@
       "success": "query execution facts and database resource state produces a verified domain result",
       "failure": "candidates vs scanned vs returned have distinct meanings",
       "verification": "python3 examples/walkthrough.py --workflow statistics"
+    },
+    {
+      "id": "partial-publish",
+      "name": "server-side partial publish of a long edit context",
+      "entry": "POST /transactions/{tx}/publish and /refresh, POST /query with view",
+      "steps": [
+        "transport",
+        "engine",
+        "versions",
+        "catalog",
+        "journal"
+      ],
+      "module_ids": [
+        "transport",
+        "engine",
+        "versions",
+        "catalog",
+        "journal"
+      ],
+      "success": "selected approved mutations publish as one complete commit while the remaining edit stays open on its pinned view",
+      "failure": "selection depending on an unapproved unique-value swap is rejected with a structured report, no sequence consumed, nothing else carried along",
+      "verification": "python3 examples/walkthrough.py --workflow partial-publish"
+    },
+    {
+      "id": "partial-recovery",
+      "name": "partial publish durability across interleaved commits and restart",
+      "entry": "POST /transactions/{tx}/publish, GET /changes, laminad startup",
+      "steps": [
+        "transport",
+        "engine",
+        "journal",
+        "versions",
+        "snapshot"
+      ],
+      "module_ids": [
+        "transport",
+        "engine",
+        "journal",
+        "versions",
+        "snapshot"
+      ],
+      "success": "after interleaving and restart only rows truly published durably are recovered with complete commit boundaries in the change feed",
+      "failure": "failed validation preserves the full private write set for retry and never-published rows do not resurrect",
+      "verification": "python3 examples/walkthrough.py --workflow partial-recovery"
     }
   ],
   "complexity": {

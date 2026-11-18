@@ -19,7 +19,7 @@ go build -o bin/laminad ./cmd/laminad
 python3 examples/walkthrough.py --workflow all
 ```
 
-该命令启动临时实例，执行 14 条真实生产入口工作流，输出逐条观测 JSON，最后关闭实例并删除本次临时目录。可用 `--workflow query-plan` 等方式只运行一条。它是有界运行演示，不是基线测试套件。测试代码和自动化测试基础设施有意留待后续工作，本基线 `testing=deferred`。
+该命令启动临时实例，执行 16 条真实生产入口工作流，输出逐条观测 JSON，最后关闭实例并删除本次临时目录。可用 `--workflow query-plan` 等方式只运行一条。它是有界运行演示，不是基线测试套件。测试代码和自动化测试基础设施有意留待后续工作，本基线 `testing=deferred`。
 
 ## 一个事务
 
@@ -51,6 +51,27 @@ curl -s http://127.0.0.1:7386/v1/lamina/sql -H 'Content-Type: application/json' 
 读事务固定开始时的提交序号，重复读稳定，支持读自己的暂存写入。普通读使用当前序号。按 `at` 查询只接受保留区间内的序号，并要求关系在该序号已存在。事务无法访问在它开始之后创建的关系。无显式排序时按类型化主键排序；排序相同时也用主键确定次序。升序 null 在前，降序 null 在后。null 普通比较不匹配；使用 `is_null` 检查。
 
 数据库提供快照隔离和同键 first-committer-wins，不承诺串行化、谓词锁或跨行写偏差防护。提交前对最终可见状态检查所有受影响关系的唯一索引；一次事务内可以置换唯一值。失败提交会关闭该事务，不发布任何私有行。只读事务通过 `{"read_only":true}` 开始。
+
+## 长编辑与部分发布
+
+一个编辑上下文（事务）可以分多次把已核准的修改先发布，其余修改继续留在同一上下文中处理。部分发布由服务端按一次完整提交的语义完成，而不是客户端拆开重建若干事务。
+
+```sh
+curl -s http://127.0.0.1:7386/v1/lamina/transactions/<id>/publish -H 'Content-Type: application/json' \
+  -d '{"selection":[{"relation":"spectra","key":8}]}'
+```
+
+`selection` 按关系和主键精确选择已暂存修改；空选择或引用未暂存键返回 400。每个被选键先做 first-committer-wins 冲突检查，再把**仅被选修改**叠加到当前已提交状态上检查唯一索引。若选择依赖尚未核准的唯一值交换（例如一次交换的一半），或与其他调用方的提交冲突，请求返回 409，且错误体附带结构化 `report`（`conflicts`、`unique_violations`、`selected`、`remaining_writes`），不消耗发布序号、不自动携带任何其他修改，整个私有写集原样保留可重试。加 `"dry_run":true` 只核对不发布。成功后被选行立即从私有写集移除并成为普通已提交版本，编辑仍保持活动，状态接口 `GET /transactions/<id>` 返回剩余写数、部分发布次数和发布序号血缘。
+
+编辑内查询默认固定开始时的读快照（`view=pinned`），继续支持读己写，且已经部分发布的行不会通过已提交存储回流，因此其他调用方的新值不可能被冒充成该编辑原先认可的读取依据。显式传 `"view":"head"` 则读取当前提交序号且**不叠加私有写覆盖**：自己早先发布的行作为普通已提交行出现，其他事务的新值也如实呈现，可与 pinned 视图对照核对。`/sql` 接受同一个 `view` 字段。
+
+```sh
+curl -s http://127.0.0.1:7386/v1/lamina/transactions/<id>/refresh -H 'Content-Type: application/json' -d '{"dry_run":true}'
+```
+
+`refresh` 把编辑的读视图从旧快照转换到当前头部。`dry_run` 只返回代价报告而不改动任何状态：`from_snapshot`/`to_snapshot`、与编辑剩余写集冲突的已提交键、剩余写集在其固定读基准上的唯一违规、新进入目录的关系，以及旧视图是否仍处于可保留读取区间（`old_view_still_readable`）。真正执行后冲突基准前进到新头部：报告中已披露的介入提交不再重复阻挡发布，而刷新之后到达的新提交仍然是全新的 first-committer-wins。持有旧视图会继续固定真空回收水位；刷新后固定解除，`POST /vacuum` 才能推进，被淘汰的旧序号查询返回 410。
+
+原有的一次 `commit` 完全保留：未做过部分发布时行为不变；做过部分发布后，`commit` 把剩余写集作为最后一次完整原子提交发布，若剩余为空则不消耗序号直接闭合。失败的发布和刷新都保留全部私有写集；编辑会话不跨重启持久化，但每次部分发布都是带 `"edit":"partial"` 标记的普通耐久日志记录，重启后 `GET /changes` 能准确列出真正发布过的行，从未发布的私有修改不会复活。
 
 SQL 只支持单条 SELECT：投影或 `count(*)`、`count(column)`、`sum(integer_column)`，可选 WHERE AND、ORDER BY、LIMIT。字符串使用单引号，内部单引号写两次；关键字及未引号标识符转为小写。没有 JOIN、GROUP BY、别名、表达式、SQL DDL/DML。语义检查与结构化查询共用绑定和执行。`sum` 忽略 null，空输入返回 null，溢出报错；`count(column)` 忽略 null，`count(*)` 计算全部匹配行。
 

@@ -24,6 +24,7 @@ func (s *Server) sql(w http.ResponseWriter, r *http.Request) {
 		SQL         string  `json:"sql"`
 		Transaction string  `json:"transaction"`
 		At          *uint64 `json:"at"`
+		View        string  `json:"view"`
 	}
 	if !decode(w, r, &in) {
 		return
@@ -35,6 +36,7 @@ func (s *Server) sql(w http.ResponseWriter, r *http.Request) {
 	}
 	q.Transaction = in.Transaction
 	q.At = in.At
+	q.View = in.View
 	out, err := s.db.Query(q)
 	if err != nil {
 		respondError(w, err)

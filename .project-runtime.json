@@ -62,6 +62,14 @@
     {
       "workflow_id": "statistics",
       "command": "python3 examples/walkthrough.py --workflow statistics"
+    },
+    {
+      "workflow_id": "partial-publish",
+      "command": "python3 examples/walkthrough.py --workflow partial-publish"
+    },
+    {
+      "workflow_id": "partial-recovery",
+      "command": "python3 examples/walkthrough.py --workflow partial-recovery"
     }
   ]
 }

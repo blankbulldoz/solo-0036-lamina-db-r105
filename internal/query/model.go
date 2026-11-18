@@ -23,8 +23,13 @@ type Request struct {
 	Limit       int         `json:"limit,omitempty"`
 	At          *uint64     `json:"at,omitempty"`
 	Transaction string      `json:"transaction,omitempty"`
-	Aggregate   *Aggregate  `json:"aggregate,omitempty"`
-	ForceScan   bool        `json:"force_scan,omitempty"`
+	// View selects the read basis of a transactional query: "pinned" (the
+	// default) freezes the edit's original snapshot and overlays its remaining
+	// private writes, while "head" reads the current committed sequence with
+	// no private overlay.
+	View      string     `json:"view,omitempty"`
+	Aggregate *Aggregate `json:"aggregate,omitempty"`
+	ForceScan bool       `json:"force_scan,omitempty"`
 }
 type Plan struct {
 	Access     string `json:"access"`

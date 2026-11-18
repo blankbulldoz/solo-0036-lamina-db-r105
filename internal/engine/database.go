@@ -13,19 +13,20 @@ import (
 )
 
 type DB struct {
-	mu           sync.RWMutex
-	dir          string
-	catalog      *catalog.Catalog
-	store        *versions.Store
-	indexes      *index.Registry
-	wal          *journal.WAL
-	sequence     uint64
-	horizon      uint64
-	transactions map[string]*Transaction
-	closed       bool
-	commits      uint64
-	conflicts    uint64
-	queries      uint64
+	mu               sync.RWMutex
+	dir              string
+	catalog          *catalog.Catalog
+	store            *versions.Store
+	indexes          *index.Registry
+	wal              *journal.WAL
+	sequence         uint64
+	horizon          uint64
+	transactions     map[string]*Transaction
+	closed           bool
+	commits          uint64
+	conflicts        uint64
+	queries          uint64
+	partialPublishes uint64
 }
 
 func Open(dir string) (*DB, error) {
